@@ -1,12 +1,15 @@
 #! /bin/bash
 pkg="etcd-aws-cluster"
 version="0.5"
+
 etcd_peers_file_path="/etc/sysconfig/etcd-peers"
-export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq --raw-output .region)
-if [[ ! $AWS_DEFAULT_REGION ]]; then
-    echo "$pkg: failed to get region"
-    exit 1
-fi
+etcd_tools_file_path="/etc/sysconfig/etcd-tools"
+
+backup_bucket=${BACKUP_BUCKET}
+etcd_data_dir=${ETCD_DATA_DIR:-/var/lib/etcd2}
+backup_dir=/backup/etcd
+echo "backup_bucket=${backup_bucket}"
+echo "etcd_data_dir=${etcd_data_dir}"
 
 # Allow default client/server ports to be changed if necessary
 client_port=${ETCD_CLIENT_PORT:-2379}
@@ -23,6 +26,12 @@ retry_times=${RETRY_TIMES:-10}
 # Add a sleep time to allow etcd client requets to finish
 wait_time=3
 
+export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq --raw-output .region)
+if [[ ! $AWS_DEFAULT_REGION ]]; then
+    echo "$pkg: failed to get region"
+    exit 1
+fi
+
 #if the script has already run just exit
 if [ -f "$etcd_peers_file_path" ]; then
     echo "$pkg: etcd-peers file $etcd_peers_file_path already created, exiting"
@@ -38,6 +47,12 @@ fi
 ec2_instance_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 if [[ ! $ec2_instance_ip ]]; then
     echo "$pkg: failed to get instance IP address"
+    exit 3
+fi
+
+ec2_instance_hostname=$(curl -s http://169.254.169.254/latest/meta-data/local-hostname)
+if [[ ! $ec2_instance_hostname ]]; then
+    echo "$pkg: failed to get instance hostname"
     exit 3
 fi
 
@@ -64,7 +79,9 @@ echo "client_client_scheme=$etcd_client_scheme"
 etcd_peer_scheme=${ETCD_PEER_SCHEME:-http}
 echo "peer_peer_scheme=$etcd_peer_scheme"
 
-etcd_peer_urls=$(aws ec2 describe-instances --instance-ids $(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name "$asg_name" | jq '.AutoScalingGroups[0].Instances[] | select(.LifecycleState  == "InService") | .InstanceId' | xargs) | jq -r ".Reservations[].Instances | map(\"$etcd_client_scheme://\" + .NetworkInterfaces[].PrivateIpAddress + \":$client_port\")[]")
+etcd_peer_urls=$(aws ec2 describe-instances --instance-ids $(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name "$asg_name" | jq '.AutoScalingGroups[0].Instances[] | select(.LifecycleState  == "InService") | .InstanceId' | xargs) | jq -r ".Reservations[].Instances | map(\"$etcd_client_scheme://\" + .NetworkInterfaces[].PrivateDnsName + \":$client_port\")[]")
+etcd_peer_ips=$(aws ec2 describe-instances --instance-ids $(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name "$asg_name" | jq '.AutoScalingGroups[0].Instances[] | select(.LifecycleState  == "InService") | .InstanceId' | xargs) | jq -r ".Reservations[].Instances | map(\"$etcd_client_scheme://\" + .NetworkInterfaces[].PrivateIpAddress + \":$client_port\")[]")
+
 if [[ ! $etcd_peer_urls ]]; then
     echo "$pkg: unable to find members of auto scaling group"
     exit 5
@@ -75,21 +92,24 @@ echo "etcd_peer_urls=$etcd_peer_urls"
 etcd_existing_peer_urls=
 etcd_existing_peer_names=
 etcd_good_member_url=
+etcd_members=
 
-for url in $etcd_peer_urls; do
+for url in $etcd_peer_ips; do
     case "$url" in
         # If we're in proxy mode this is an error, but unlikely to happen?
         *$ec2_instance_ip*) continue;;
     esac
 
     etcd_members=$(curl $ETCD_CURLOPTS -f -s $url/v2/members)
+    echo "curl $ETCD_CURLOPTS -f -s $url/v2/members"
+    echo $(curl $ETCD_CURLOPTS -v $url/v2/members)
 
     if [[ $? == 0 && $etcd_members ]]; then
         etcd_good_member_url="$url"
-		echo "etcd_members=$etcd_members"
+        echo "etcd_members=$etcd_members"
         etcd_existing_peer_urls=$(echo "$etcd_members" | jq --raw-output .[][].peerURLs[0])
-		etcd_existing_peer_names=$(echo "$etcd_members" | jq --raw-output .[][].name)
-	break
+        etcd_existing_peer_names=$(echo "$etcd_members" | jq --raw-output .[][].name)
+    break
     fi
 done
 
@@ -103,7 +123,7 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
     echo "joining existing cluster"
 
     # eject bad members from cluster
-    peer_regexp=$(echo "$etcd_peer_urls" | sed 's/^.*https\{0,1\}:\/\/\([0-9.]*\):[0-9]*.*$/contains(\\"\/\/\1:\\")/' | xargs | sed 's/  */ or /g')
+    peer_regexp=$(echo "$etcd_peer_urls" | sed 's/^.*https\{0,1\}:\/\/\(ip-[0-9a-z\-]*.[a-z0-9.]*\):[0-9]*.*$/contains(\\"\/\/\1:\\")/' | xargs | sed 's/  */ or /g')
     if [[ ! $peer_regexp ]]; then
         echo "$pkg: failed to create peer regular expression"
         exit 6
@@ -133,7 +153,7 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
 
     # If we're not a proxy we add ourselves as a member to the cluster
     if [[ ! $PROXY_ASG ]]; then
-        peer_url="$etcd_peer_scheme://$ec2_instance_ip:$server_port"
+        peer_url="$etcd_peer_scheme://$ec2_instance_hostname:$server_port"
         etcd_initial_cluster=$(curl $ETCD_CURLOPTS -s -f "$etcd_good_member_url/v2/members" | jq --raw-output '.[] | map(.name + "=" + .peerURLs[0]) | .[]' | xargs | sed 's/  */,/g')$(echo ",$ec2_instance_id=$peer_url")
         echo "etcd_initial_cluster=$etcd_initial_cluster"
         if [[ ! $etcd_initial_cluster ]]; then
@@ -169,6 +189,9 @@ if [[ $etcd_existing_peer_urls && $etcd_existing_peer_names != *"$ec2_instance_i
 ETCD_INITIAL_CLUSTER_STATE=existing
 ETCD_NAME=$ec2_instance_id
 ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
+ETCD_ADVERTISE_CLIENT_URLS=$etcd_client_scheme://$ec2_instance_hostname:$client_port
+ETCD_INITIAL_ADVERTISE_PEER_URLS=$etcd_peer_scheme://$ec2_instance_hostname:$server_port
+ETCD_DATA_DIR=$etcd_data_dir
 ETCD_PROXY=$etcd_proxy
 EOF
 
@@ -177,7 +200,7 @@ else
     # create a new cluster
     echo "creating new cluster"
 
-    etcd_initial_cluster=$(aws ec2 describe-instances --instance-ids $(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name "$asg_name" | jq .AutoScalingGroups[0].Instances[].InstanceId | xargs) | jq -r ".Reservations[].Instances | map(.InstanceId + \"=$etcd_peer_scheme://\" + .NetworkInterfaces[].PrivateIpAddress + \":$server_port\")[]" | xargs | sed 's/  */,/g')
+    etcd_initial_cluster=$(aws ec2 describe-instances --instance-ids $(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name "$asg_name" | jq .AutoScalingGroups[0].Instances[].InstanceId | xargs) | jq -r ".Reservations[].Instances | map(.InstanceId + \"=$etcd_peer_scheme://\" + .NetworkInterfaces[].PrivateDnsName + \":$server_port\")[]" | xargs | sed 's/  */,/g')
     echo "etcd_initial_cluster=$etcd_initial_cluster"
     if [[ ! $etcd_initial_cluster ]]; then
         echo "$pkg: unable to get peers from auto scaling group"
@@ -188,7 +211,42 @@ else
 ETCD_INITIAL_CLUSTER_STATE=new
 ETCD_NAME=$ec2_instance_id
 ETCD_INITIAL_CLUSTER="$etcd_initial_cluster"
+ETCD_ADVERTISE_CLIENT_URLS=$etcd_client_scheme://$ec2_instance_hostname:$client_port
+ETCD_INITIAL_ADVERTISE_PEER_URLS=$etcd_peer_scheme://$ec2_instance_hostname:$server_port
+ETCD_DATA_DIR=$etcd_data_dir
+EOF
+
+    if [ $backup_bucket ]; then
+        if [ ! -d $etcd_data_dir/member ]; then
+          mkdir -p /backup/etcd/restore
+          aws s3 sync s3://$backup_bucket /backup/etcd/restore
+          if [ -d /backup/etcd/restore/member ]; then
+            echo "S3 Backup Exists."
+            mv /backup/etcd/restore/member $etcd_data_dir/member
+            if [ ! -d $etcd_data_dir/member/snap ]; then
+              mkdir -p $etcd_data_dir/member/snap
+            fi
+            cat >> "$etcd_peers_file_path" <<EOF
+ETCD_FORCE_NEW_CLUSTER=true
+ETCD_RESTORED=yes
+EOF
+          fi
+        fi
+    fi
+
+fi
+
+if ! grep -q "ETCDCTL_ENDPOINT" "$etcd_tools_file_path"; then
+    cat >> "$etcd_tools_file_path" <<EOF
+ETCDCTL_ENDPOINT=$etcd_client_scheme://$ec2_instance_hostname:$client_port
 EOF
 fi
+
+if ! grep -q "FLANNELD_ETCD_ENDPOINTS" "$etcd_tools_file_path"; then
+    cat >> "$etcd_tools_file_path" <<EOF
+FLANNELD_ETCD_ENDPOINTS=$etcd_client_scheme://$ec2_instance_hostname:$client_port
+EOF
+fi
+
 
 exit 0
