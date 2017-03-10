@@ -12,12 +12,36 @@ This container serves to assist in the creation of an etcd (2.x) cluster from an
 - ETCD_INITIAL_CLUSTER
   - this is a list of the machines (id and ip) expected to be in the cluster, including the new machine
   - e.g., "i-5fc4c9e1=http://10.0.0.1:2380,i-694fad83=http://10.0.0.2:2380"
+- ETCD_FORCE_NEW_CLUSTER
+  - This gets set if the backup bucket contains a backup, but we want to ignore the existing config and just use the relevant data.
+  - e.g., "true"
+- ETCD_DATA_DIR
+  - Can also be passed into the container to override the default directory.
+  - e.g. default, "/var/lib/etcd2"
+- ETCD_RESTORED
+  - This gets set if the backup was performed, etcd will ignore it.
+  - e.g., "my-bucket"
 
 This file can then be loaded as an EnvironmentFile in an etcd2 drop-in to properly configure etcd2:
 
 ```
 [Service]
 EnvironmentFile=/etc/sysconfig/etcd-peers
+```
+
+It also writes a file to /etc/sysconfig/etcd-tools that contains parameters for flannel and etcdctl:
+
+- ETCDCTL_ENDPOINT
+  - This configures the etcdctl client to use the proper protocol.
+- FLANNELD_ETCD_ENDPOINTS
+  - This provides the endpoints that flannel should be reading/writing from/to.
+
+
+This file can then be loaded as an EnvironmentFile in an flanneld drop-in to properly configure flannel and etcdctl:
+
+```
+[Service]
+EnvironmentFile=/etc/sysconfig/etcd-tools
 ```
 
 Workflow
