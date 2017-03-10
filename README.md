@@ -76,6 +76,7 @@ Environment Variables
 * ASG_BY_TAG - If specified in conjunction with PROXY_ASG uses the value of PROXY_ASG to look up the server by the Tag Name
 * ETCD_CLIENT_SCHEME - defaults to http
 * ETCD_PEER_SCHEME - defaults to http
+* BACKUP_BUCKET - no default, skips tasks related to s3 without it.
 
 
 Demo
